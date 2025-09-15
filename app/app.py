@@ -204,27 +204,52 @@ def _save_output(path: Path, sheets: dict):
         for name, df in sheets.items():
             df.to_excel(writer, sheet_name=name, index=False)
 
-# ------------------ cálculo do IV ------------------
-def _sum_pesos_categoria(cat: str, quest_df: pd.DataFrame) -> float:
-    pesos = quest_df.loc[quest_df["Categoria"] == str(cat), "Peso_q"]
-    if pesos.empty:
-        return 1.0
-    return float(pd.to_numeric(pesos, errors="coerce").fillna(0).sum())
+# ------------------ cálculo do IV (NOVA LÓGICA) ------------------
+def _build_category_norms(quest_df: pd.DataFrame):
+    """
+    norms[cat][pergunta] = fração normalizada (soma por categoria = 1).
+    Se não houver pesos válidos numa categoria, divide igualmente entre as perguntas.
+    Se uma pergunta/categoria não aparecer em norms, o fallback será fração 1.0 (bloco único).
+    """
+    q = quest_df.copy()
+    q["Peso_q"] = pd.to_numeric(q.get("Peso_q", 1.0), errors="coerce").fillna(0.0)
+
+    norms = {}
+    for cat, grp in q.groupby("Categoria"):
+        total = grp["Peso_q"].sum()
+        if total > 0:
+            norms[str(cat)] = {str(r["Pergunta"]): float(r["Peso_q"] / total) for _, r in grp.iterrows()}
+        else:
+            n = max(len(grp), 1)
+            frac = 1.0 / n
+            norms[str(cat)] = {str(r["Pergunta"]): frac for _, r in grp.iterrows()}
+    return norms
 
 def _build_maps_for_control(block_df: pd.DataFrame):
     comp2hc = {}
     for _, r in block_df.iterrows():
-        hc = r.get("Hierarquia (Componente)")
-        val = _to_float(hc, 0.0)
-        if val <= 0: val = 1.0
-        comp2hc[str(r.get("Componente","-"))] = val
+        hc = _to_float(r.get("Hierarquia (Componente)"), 0.0)
+        if hc <= 0:
+            hc = 1.0
+        comp2hc[str(r.get("Componente", "-"))] = hc
     hctrl_raw = block_df["Hierarquia (Controle)"].dropna().tolist()
     hctrl = _to_float(hctrl_raw[0], 0.0) if hctrl_raw else 0.0
     return comp2hc, hctrl
 
 def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
                            controles_rows: list, quest_rows: list):
+    """
+    Para cada CC:
+      - Nt = soma dos hc de cada componente listado no catálogo (cada comp vale sua Hierarquia (Componente)).
+      - Perguntas por componente/categoria são normalizadas (somam 1*hc via frações).
+      - Nf soma hc*fração das perguntas respondidas "Sim".
+      - "Não Aplica" remove hc*fração do Nt.
+      - IV_CC = (Nt - Nf) / Nt.
+    IV_ativo = média ponderada dos IV_CC por Hierarquia (Controle).
+    """
+    cat_norms = _build_category_norms(quest_df)
     e1_map = {r["controle"]: r["etapa1"] for r in controles_rows}
+
     resultados = []
     controles = list(flt_df["Verificar"].dropna().unique())
 
@@ -236,35 +261,53 @@ def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
         comp2hc, hctrl = _build_maps_for_control(block)
         etapa1 = e1_map.get(ctrl, "Existe")
 
+        # Denominador base: soma dos pesos de hierarquia (Componente) dos itens do bloco
         base_Nt = 0.0
         for _, r in block.iterrows():
-            cat  = str(r.get("Categoria","-"))
-            comp = str(r.get("Componente","-"))
-            base_Nt += comp2hc.get(comp, 0.0) * _sum_pesos_categoria(cat, quest_df)
+            comp = str(r.get("Componente", "-"))
+            hc   = comp2hc.get(comp, 0.0)
+            base_Nt += hc
 
         if etapa1 == "Não Existe":
             Nt = base_Nt
             Nf = 0.0
             IV = 1.0 if Nt > 0 else 0.0
+
         elif etapa1 == "Não Aplica":
             Nt = 0.0
             Nf = 0.0
             IV = 0.0
+
         else:
             Nt = base_Nt
             Nf = 0.0
+
             rows_ctrl = [q for q in quest_rows if q["controle"] == ctrl]
             for q in rows_ctrl:
-                comp = q["componente"]
-                w    = _to_float(q.get("peso_q"), 0.0)
-                hc   = comp2hc.get(comp, 0.0)
-                resp = q.get("resposta","Sim")
+                comp = str(q["componente"])
+                cat  = str(q.get("categoria", ""))
+                perg = str(q.get("pergunta", ""))
+                resp = q.get("resposta", "Sim")
+
+                hc = comp2hc.get(comp, 0.0)
+
+                # fração da pergunta dentro da categoria (normalizada)
+                if cat in cat_norms and perg in cat_norms[cat]:
+                    frac = cat_norms[cat][perg]
+                else:
+                    # Fallback: se a categoria não tem perguntas cadastradas, considere bloco único
+                    frac = 1.0
+
+                peff = hc * float(frac)
+
                 if resp == "Sim":
-                    Nf += hc * w
+                    Nf += peff
                 elif resp == "Não Aplica":
-                    Nt -= hc * w
-            if Nt < 0: Nt = 0.0
-            IV = (Nt - Nf)/Nt if Nt > 0 else 0.0
+                    Nt -= peff  # retira do denominador
+
+            if Nt < 0:
+                Nt = 0.0
+            IV = (Nt - Nf) / Nt if Nt > 0 else 0.0
 
         resultados.append({
             "controle": ctrl,
