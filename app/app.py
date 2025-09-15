@@ -137,12 +137,22 @@ def load_items_cr() -> pd.DataFrame | None:
     df = pd.read_excel(f, sheet_name=0)
     df = _rename_items_cols(df)
 
+    # Converte numéricos
     for numcol in ["Peso", "Hierarquia (Controle)", "Hierarquia (Componente)"]:
         if numcol in df.columns:
             df[numcol] = (
                 df[numcol].astype(str).str.replace(",", ".", regex=False)
                 .apply(lambda x: pd.to_numeric(x, errors="coerce"))
             )
+
+    # Fallback: se "Hierarquia (Componente)" estiver vazio/zero, usa "Peso"
+    if "Hierarquia (Componente)" in df.columns:
+        hc_series = pd.to_numeric(df["Hierarquia (Componente)"], errors="coerce")
+        if hc_series.isna().all() or (hc_series.fillna(0) == 0).all():
+            if "Peso" in df.columns:
+                df["Hierarquia (Componente)"] = pd.to_numeric(df["Peso"], errors="coerce")
+    elif "Peso" in df.columns:
+        df["Hierarquia (Componente)"] = pd.to_numeric(df["Peso"], errors="coerce")
 
     for col in ["Programa","Família","Cenário de Risco","Verificar","Componente",
                 "Tipo de Controle","Categoria","Ameaça",
@@ -204,7 +214,7 @@ def _save_output(path: Path, sheets: dict):
         for name, df in sheets.items():
             df.to_excel(writer, sheet_name=name, index=False)
 
-# ------------------ cálculo do IV (NOVA LÓGICA) ------------------
+# ------------------ cálculo do IV (normalização + guards) ------------------
 def _build_category_norms(quest_df: pd.DataFrame):
     """
     norms[cat][pergunta] = fração normalizada (soma por categoria = 1).
@@ -228,10 +238,15 @@ def _build_category_norms(quest_df: pd.DataFrame):
 def _build_maps_for_control(block_df: pd.DataFrame):
     comp2hc = {}
     for _, r in block_df.iterrows():
-        hc = _to_float(r.get("Hierarquia (Componente)"), 0.0)
-        if hc <= 0:
-            hc = 1.0
-        comp2hc[str(r.get("Componente", "-"))] = hc
+        # tenta primeiro Hierarquia (Componente); se vazio/0 cai para Peso
+        hc = r.get("Hierarquia (Componente)")
+        hc_val = _to_float(hc, None)
+        if hc_val is None or hc_val <= 0:
+            hc_val = _to_float(r.get("Peso"), 0.0)
+        if hc_val <= 0:
+            hc_val = 1.0
+        comp2hc[str(r.get("Componente", "-"))] = hc_val
+
     hctrl_raw = block_df["Hierarquia (Controle)"].dropna().tolist()
     hctrl = _to_float(hctrl_raw[0], 0.0) if hctrl_raw else 0.0
     return comp2hc, hctrl
@@ -240,13 +255,15 @@ def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
                            controles_rows: list, quest_rows: list):
     """
     Para cada CC:
-      - Nt = soma dos hc de cada componente listado no catálogo (cada comp vale sua Hierarquia (Componente)).
+      - Nt = soma dos hc de cada componente (Hierarquia (Componente) ou Peso).
       - Perguntas por componente/categoria são normalizadas (somam 1*hc via frações).
-      - Nf soma hc*fração das perguntas respondidas "Sim".
+      - Nf soma hc*fração das perguntas "Sim".
       - "Não Aplica" remove hc*fração do Nt.
-      - IV_CC = (Nt - Nf) / Nt.
-    IV_ativo = média ponderada dos IV_CC por Hierarquia (Controle).
+      - IV_CC = (Nt - Nf) / Nt, com travas numéricas.
+    IV_ativo = média ponderada por Hierarquia (Controle), também travado em [0,1].
     """
+    EPS = 1e-12
+
     cat_norms = _build_category_norms(quest_df)
     e1_map = {r["controle"]: r["etapa1"] for r in controles_rows}
 
@@ -261,17 +278,15 @@ def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
         comp2hc, hctrl = _build_maps_for_control(block)
         etapa1 = e1_map.get(ctrl, "Existe")
 
-        # Denominador base: soma dos pesos de hierarquia (Componente) dos itens do bloco
-        base_Nt = 0.0
+        # Denominador base: soma dos hc dos componentes
+        Nt = 0.0
         for _, r in block.iterrows():
             comp = str(r.get("Componente", "-"))
-            hc   = comp2hc.get(comp, 0.0)
-            base_Nt += hc
+            Nt  += comp2hc.get(comp, 0.0)
 
         if etapa1 == "Não Existe":
-            Nt = base_Nt
             Nf = 0.0
-            IV = 1.0 if Nt > 0 else 0.0
+            IV = 1.0 if Nt > EPS else 0.0
 
         elif etapa1 == "Não Aplica":
             Nt = 0.0
@@ -279,7 +294,6 @@ def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
             IV = 0.0
 
         else:
-            Nt = base_Nt
             Nf = 0.0
 
             rows_ctrl = [q for q in quest_rows if q["controle"] == ctrl]
@@ -290,14 +304,7 @@ def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
                 resp = q.get("resposta", "Sim")
 
                 hc = comp2hc.get(comp, 0.0)
-
-                # fração da pergunta dentro da categoria (normalizada)
-                if cat in cat_norms and perg in cat_norms[cat]:
-                    frac = cat_norms[cat][perg]
-                else:
-                    # Fallback: se a categoria não tem perguntas cadastradas, considere bloco único
-                    frac = 1.0
-
+                frac = cat_norms.get(cat, {}).get(perg, 1.0)  # fallback bloco único
                 peff = hc * float(frac)
 
                 if resp == "Sim":
@@ -305,9 +312,18 @@ def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
                 elif resp == "Não Aplica":
                     Nt -= peff  # retira do denominador
 
-            if Nt < 0:
-                Nt = 0.0
-            IV = (Nt - Nf) / Nt if Nt > 0 else 0.0
+            # Guard-rails
+            if Nt < 0: Nt = 0.0
+            if Nf < 0: Nf = 0.0
+            if Nf > Nt: Nf = Nt  # evita Nf > Nt por arredondamento
+
+            if Nt <= EPS:
+                IV = 0.0
+            else:
+                IV = (Nt - Nf) / Nt
+                if abs(IV) < EPS:  # limpa -0.00%
+                    IV = 0.0
+                IV = max(0.0, min(1.0, IV))  # clamp em [0,1]
 
         resultados.append({
             "controle": ctrl,
@@ -321,6 +337,8 @@ def compute_iv_per_control(flt_df: pd.DataFrame, quest_df: pd.DataFrame,
         soma_pesosxIV   += hctrl * IV
 
     iv_ativo = (soma_pesosxIV / soma_pesos_ctrl) if soma_pesos_ctrl > 0 else 0.0
+    iv_ativo = max(0.0, min(1.0, iv_ativo))  # trava em [0,1]
+
     return resultados, iv_ativo, soma_pesos_ctrl
 
 # ------------------ CSS ------------------
@@ -567,8 +585,15 @@ if salvar:
                 "iv_controle":"Índice de Vulnerabilidade (CC)",
                 "etapa1":"Etapa 1"
             })
-            # % com 2 casas
-            df_show["Índice de Vulnerabilidade (CC)"] = df_show["Índice de Vulnerabilidade (CC)"].apply(lambda x: f"{float(x):.2%}")
+            # clamp no output para evitar "-0,00%"
+            df_show["Índice de Vulnerabilidade (CC)"] = (
+                pd.to_numeric(df_show["Índice de Vulnerabilidade (CC)"], errors="coerce")
+                .clip(lower=0, upper=1)
+                .apply(lambda x: f"{float(x):.2%}")
+            )
             df_show = df_show[["Controle","Hierarquia (Ctrl.)","Índice de Vulnerabilidade (CC)","Etapa 1"]]
             st.dataframe(df_show, use_container_width=True)
-        st.metric(label="Índice de Vulnerabilidade do Ativo", value=f"{iv_ativo:.2%}")
+
+        # métrica do ativo (também clampada)
+        iv_fmt = max(0.0, min(1.0, float(iv_ativo)))
+        st.metric(label="Índice de Vulnerabilidade do Ativo", value=f"{iv_fmt:.2%}")
